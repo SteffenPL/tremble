@@ -3,8 +3,13 @@ from fenics import grad, inner, div, dot, tr, det
 from math import pi
 import numpy as np
 import matplotlib.pyplot as plt
+import time
 
 from load_meshes import load_2d_muscle_geo, load_2d_muscle_bc
+
+from plotting_tools import *
+
+
 
 mesh, dx, ds, boundaries = load_2d_muscle_geo()
 cell = mesh.ufl_cell()
@@ -41,6 +46,130 @@ c_01 = fe.Constant(2e3)
 rho = fe.Constant(1.)
 
 B = fe.Constant((0.,0.))
+
+
+class Solution(fe.Function):
+    def __init__(self, u=None, p=None, v=None, t=None):
+        super().__init__(V_upv)
+        self.reset()
+
+        if u is not None:
+            self.u = u
+        if p is not None:
+            self.p = p
+
+        if v is not None:
+            self.v = v
+
+        if t is not None:
+            self.t = t
+
+
+    def reset(self):
+        self.__u = None
+        self.__p = None
+        self.__v = None
+        self.__up = None
+        self.__pv = None
+        self.__uv = None
+        self.t = 0
+        self.__upv = self
+
+    @property
+    def u(self):
+        if self.__u is None and self.__upv is not None:
+            self.__u = fe.Function(V_u)
+            fe.assign(self.__u, self.__upv.sub(0))
+        return self.__u
+
+    @property
+    def p(self):
+        if self.__p is None and self.__upv is not None:
+            self.__p = fe.Function(V_p)
+            fe.assign(self.__p, self.__upv.sub(1))
+        return self.__p
+
+    @property
+    def v(self):
+        if self.__v is None and self.__upv is not None:
+            self.__v = fe.Function(V_v)
+            fe.assign(self.__v, self.__upv.sub(2))
+        return self.__v
+
+    @property
+    def up(self):
+        if self.__up is None and self.__upv is not None:
+            self.__up = fe.Function(V_up)
+            fe.assign(self.__up.sub(0), self.__upv.sub(0))
+            fe.assign(self.__up.sub(1), self.__upv.sub(1))
+        return self.__up
+
+    @property
+    def uv(self):
+        if self.__uv is None and self.__upv is not None:
+            self.__uv = fe.Function(V_uv)
+            fe.assign(self.__uv.sub(0), self.__upv.sub(0))
+            fe.assign(self.__uv.sub(1), self.__upv.sub(2))
+        return self.__uv
+
+
+    @property
+    def pv(self):
+        if self.__pv is None and self.__upv is not None:
+            self.__pv = fe.Function(V_pv)
+            fe.assign(self.__pv.sub(0), self.upv.sub(1))
+            fe.assign(self.__pv.sub(1), self.upv.sub(2))
+        return self.__pv
+
+    @property
+    def upv(self):
+        return self.__upv
+
+    @upv.setter
+    def upv(self, val):
+        self.reset()
+        fe.assign(self.__upv, val)
+
+    @u.setter
+    def u(self, val):
+        self.__u = None
+        self.__up = None
+        self.__uv = None
+
+        fe.assign(self.__upv.sub(0), val)
+
+    @p.setter
+    def p(self, val):
+        self.__p = None
+        self.__up = None
+        self.__pv = None
+
+        fe.assign(self.__upv.sub(1), val)
+
+    @v.setter
+    def v(self, val):
+        self.__v = None
+        self.__uv = None
+        self.__pv = None
+
+        fe.assign(self.__upv.sub(2), val)
+
+    @up.setter
+    def up(self, val):
+        self.u = val.sub(0)
+        self.p = val.sub(1)
+
+    @uv.setter
+    def uv(self, val):
+        self.u = val.sub(0)
+        self.v = val.sub(1)
+
+    @pv.setter
+    def pv(self, val):
+        self.p = val.sub(0)
+        self.v = val.sub(1)
+
+
 
 
 def deformation_grad(u):
@@ -136,11 +265,11 @@ def solve_steady_state_heiser_weissinger(kappa):
     # Modified Lagrange function (with constraints)
     L_mod = L - p*g
     P = first_piola_stress(L, F)
-    G = incompr_stress(g, F)
+    G = incompr_stress(g, F)  # = J*fe.inv(F.T)
 
     Lp = const_eq(L_mod, p)
 
-    a_static = weak_div_term(P - p*G, eta) + inner(B, eta)*dx + inner(Lp, q)*dx
+    a_static = weak_div_term(P + p*G, eta) + inner(B, eta)*dx + inner(Lp, q)*dx
 
     J_static = fe.derivative(a_static, w, dw)
     ffc_options = {"optimize": True}
@@ -151,7 +280,87 @@ def solve_steady_state_heiser_weissinger(kappa):
 
     return w
 
-B.assign(fe.Constant((10000,0)))
+
+
+def explicit_relax_dyn(w0, kappa=1e5, dt=1.e-5, t_end=1.e-4, show_plots=False):
+
+    (u0, p0, v0) = fe.split(w0)
+
+
+
+    bcs_u, bcs_p, bcs_v = load_2d_muscle_bc(V_upv.sub(0), V_upv.sub(1), V_upv.sub(2), boundaries)
+
+    kappa = fe.Constant(kappa)
+
+
+    F = deformation_grad(u0)
+    I_1, I_2, J = invariants(F)
+    F_iso = isochronic_deformation_grad(F, J)
+    #I_1_iso, I_2_iso  = invariants(F_iso)[0:2]
+
+    W = material_mooney_rivlin(I_1, I_2, c_10, c_01) + incompr_relaxation(p0, kappa)
+    g = incompr_constr(J)
+
+    # Lagrange function (without constraint)
+
+    L = -W
+    P = first_piola_stress(L, F)
+    G = incompr_stress(g, F)
+
+    (u1, p1, v1) = fe.TrialFunctions(V_upv)
+    (eta, q, xi) = fe.TestFunctions(V_upv)
+    a_dyn_u = inner(u1-u0, eta)*dx - dt*inner(v1, eta)*dx
+    a_dyn_p = (p1-p0)*q*dx - dt*kappa*div(v1)*J*q*dx
+    #a_dyn_v = rho*inner(v1-v0, xi)*dx + dt*(inner(P + p0*G, grad(xi))*dx - inner(B, xi)*dx)
+    a_dyn_v = rho*inner(v1-v0, xi)*dx + dt*(inner(P, grad(xi))*dx + inner(p0*G,grad(xi))*dx - inner(B, xi)*dx)
+
+
+
+    a = fe.lhs(a_dyn_u + a_dyn_p + a_dyn_v)
+    l = fe.rhs(a_dyn_u + a_dyn_p + a_dyn_v)
+
+    w1 = fe.Function(V_upv)
+    w2 = fe.Function(V_upv)
+
+    sol = []
+
+    vol = fe.assemble(1.*dx)
+
+
+    t = 0
+    while t < t_end:
+        print("progress: %f" % (100.*t/t_end))
+
+        A = fe.assemble(a)
+        L = fe.assemble(l)
+
+        for bc in bcs_u + bcs_p + bcs_v:
+            bc.apply(A, L)
+
+        fe.solve(A, w1.vector(), L)
+
+        if fe.norm(w1.vector()) > 1e7:
+            print('ERROR: norm explosion')
+            break
+
+        # update initial values for next step
+        w0.assign(w1)
+        t += dt
+
+        if show_plots:
+            # plot result
+            fe.plot(w0.sub(0), mode='displacement')
+            plt.show()
+
+        # save solutions
+        sol.append(Solution(t=t))
+        sol[-1].upv.assign(w0)
+
+    return sol, W, kappa
+
+
+
+B.assign(fe.Constant((10000, 0)))
 
 w = solve_steady_state_heiser_weissinger(kappa=1e7)
 fe.plot(w.sub(0), mode='displacement')
@@ -160,66 +369,25 @@ plt.show()
 
 B.assign(fe.Constant((0,0)))
 
-w0 = fe.Function(V_upv)
-fe.assign( w0.sub(0), w.sub(0))
-#fe.assign( w0.sub(1), w.sub(1))
+w0 = Solution()
+w0.up = w
+w0.t = 0
 
-#def explicit_relax_dyn(w0, kappa=1e6):
+dt = 1.e-5
+sol, W, kappa = explicit_relax_dyn(w0, kappa=1e4, dt=dt, t_end=1000*dt, show_plots=False)
+# dif = explicit_relax_dyn(w0, kappa=1e4, dt=dt, t_end=1000*dt, show_plots=False)
 
 (u0, p0, v0) = fe.split(w0)
+T = 0.5*rho*inner(v0,v0)
+
+plot_form(sol, w0, W*dx)
+plot_form(sol, w0, T*dx)
+plot_form(sol, w0, (T+W)*dx)
+plot_form(sol, w0, (det(deformation_grad(u0)))*dx)
 
 
-(u1, p1, v1) = fe.TrialFunctions(V_upv)
-(eta, q, xi) = fe.TestFunctions(V_upv)
 
-p1 = fe.variable(p1)
-kappa = fe.Constant(1e7)
-
-bcs_u, bcs_p, bcs_v = load_2d_muscle_bc(V_upv.sub(0), V_upv.sub(1), V_upv.sub(2), boundaries)
-
-F = deformation_grad(u0)
-I_1, I_2, J = invariants(F)
-F_iso = isochronic_deformation_grad(F, J)
-I_1_iso, I_2_iso  = invariants(F)[0:2]
-
-W = material_mooney_rivlin(I_1, I_2, c_10, c_01) + incompr_relaxation(p0, kappa)
-g = incompr_constr(J)
-
-# Lagrange function (without constraint)
-L = -W
-
-# Modified Lagrange function (with constraints)
-P = first_piola_stress(L, F)
-G = incompr_stress(g, F)
-
-
-dt = 1.e-6
-
-a_dyn_u = inner(u1-u0, eta)*dx - dt*inner(v0, eta)*dx
-a_dyn_p = (p1-p0)*q*dx - dt*kappa*div(v0)*J*q*dx
-a_dyn_v = rho*inner(v1-v0, xi)*dx - dt*(-inner(P + p0*G, grad(xi))*dx + inner(B, xi)*dx)
-
-a = fe.lhs(a_dyn_u + a_dyn_p + a_dyn_v)
-l = fe.rhs(a_dyn_u + a_dyn_p + a_dyn_v)
-
-w1 = fe.Function(V_upv)
-
-t_end = dt*1
-t = 0
-
-while t < 3*t_end:
-
-    fe.solve(a == l, w1, bcs_u + bcs_p + bcs_v)
-
-    # update initial values for next step
-    w0.assign(w1)
-    t += dt
-
-
-    # plot result
-    fe.plot(w0.sub(0), mode='displacement')
-    plt.show()
-
+save_to_vtk(sol)
 
 """
 # def solve_dynamics():
