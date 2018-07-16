@@ -48,6 +48,7 @@ rho = fe.Constant(1.)
 B = fe.Constant((0.,0.))
 
 
+# bad class design, properties return copies!
 class Solution(fe.Function):
     def __init__(self, u=None, p=None, v=None, t=None):
         super().__init__(V_upv)
@@ -79,37 +80,37 @@ class Solution(fe.Function):
     def u(self):
         if self.__u is None and self.__upv is not None:
             self.__u = fe.Function(V_u)
-            fe.assign(self.__u, self.__upv.sub(0))
+        fe.assign(self.__u, self.__upv.sub(0))
         return self.__u
 
     @property
     def p(self):
         if self.__p is None and self.__upv is not None:
             self.__p = fe.Function(V_p)
-            fe.assign(self.__p, self.__upv.sub(1))
+        fe.assign(self.__p, self.__upv.sub(1))
         return self.__p
 
     @property
     def v(self):
         if self.__v is None and self.__upv is not None:
             self.__v = fe.Function(V_v)
-            fe.assign(self.__v, self.__upv.sub(2))
+        fe.assign(self.__v, self.__upv.sub(2))
         return self.__v
 
     @property
     def up(self):
         if self.__up is None and self.__upv is not None:
             self.__up = fe.Function(V_up)
-            fe.assign(self.__up.sub(0), self.__upv.sub(0))
-            fe.assign(self.__up.sub(1), self.__upv.sub(1))
+        fe.assign(self.__up.sub(0), self.__upv.sub(0))
+        fe.assign(self.__up.sub(1), self.__upv.sub(1))
         return self.__up
 
     @property
     def uv(self):
         if self.__uv is None and self.__upv is not None:
             self.__uv = fe.Function(V_uv)
-            fe.assign(self.__uv.sub(0), self.__upv.sub(0))
-            fe.assign(self.__uv.sub(1), self.__upv.sub(2))
+        fe.assign(self.__uv.sub(0), self.__upv.sub(0))
+        fe.assign(self.__uv.sub(1), self.__upv.sub(2))
         return self.__uv
 
 
@@ -117,8 +118,9 @@ class Solution(fe.Function):
     def pv(self):
         if self.__pv is None and self.__upv is not None:
             self.__pv = fe.Function(V_pv)
-            fe.assign(self.__pv.sub(0), self.upv.sub(1))
-            fe.assign(self.__pv.sub(1), self.upv.sub(2))
+
+        fe.assign(self.__pv.sub(0), self.upv.sub(1))
+        fe.assign(self.__pv.sub(1), self.upv.sub(2))
         return self.__pv
 
     @property
@@ -286,8 +288,6 @@ def explicit_relax_dyn(w0, kappa=1e5, dt=1.e-5, t_end=1.e-4, show_plots=False):
 
     (u0, p0, v0) = fe.split(w0)
 
-
-
     bcs_u, bcs_p, bcs_v = load_2d_muscle_bc(V_upv.sub(0), V_upv.sub(1), V_upv.sub(2), boundaries)
 
     kappa = fe.Constant(kappa)
@@ -359,6 +359,170 @@ def explicit_relax_dyn(w0, kappa=1e5, dt=1.e-5, t_end=1.e-4, show_plots=False):
     return sol, W, kappa
 
 
+def impl_dyn(w0, dt=1.e-5, t_end=1.e-4, show_plots=False):
+
+    (u0, p0, v0) = fe.split(w0)
+
+    bcs_u, bcs_p, bcs_v = load_2d_muscle_bc(V_upv.sub(0), V_upv.sub(1), V_upv.sub(2), boundaries)
+
+
+    # Lagrange function (without constraint)
+
+    (u1, p1, v1) = fe.TrialFunctions(V_upv)
+    (eta, q, xi) = fe.TestFunctions(V_upv)
+
+    F = deformation_grad(u1)
+    I_1, I_2, J = invariants(F)
+    F_iso = isochronic_deformation_grad(F, J)
+    #I_1_iso, I_2_iso  = invariants(F_iso)[0:2]
+
+    W = material_mooney_rivlin(I_1, I_2, c_10, c_01)
+    g = incompr_constr(J)
+    L = -W
+    P = first_piola_stress(L, F)
+    G = incompr_stress(g, F)
+
+
+    a_dyn_u = inner(u1-u0, eta)*dx - dt*inner(v1, eta)*dx
+    a_dyn_p = inner(g,q)*dx
+    a_dyn_v = rho*inner(v1-v0, xi)*dx + dt*(inner(P, grad(xi))*dx + inner(p1*G,grad(xi))*dx - inner(B, xi)*dx)
+
+    a = a_dyn_u + a_dyn_p + a_dyn_v
+
+    w1 = fe.Function(V_upv)
+
+    sol = []
+
+
+    t = 0
+    while t < t_end:
+        print("progress: %f" % (100.*t/t_end))
+
+        fe.solve(a==0, w1, bcs_u + bcs_p + bcs_v)
+
+        if fe.norm(w1.vector()) > 1e7:
+            print('ERROR: norm explosion')
+            break
+
+        # update initial values for next step
+        w0.assign(w1)
+        t += dt
+
+        if show_plots:
+            # plot result
+            fe.plot(w0.sub(0), mode='displacement')
+            plt.show()
+
+        # save solutions
+        sol.append(Solution(t=t))
+        sol[-1].upv.assign(w0)
+
+    return sol, W, kappa
+
+
+
+def half_exp_dyn(w0, dt=1.e-5, t_end=1.e-4, show_plots=False):
+
+    u0 = w0.u
+    p0 = w0.p
+    v0 = w0.v
+
+    bcs_u, bcs_p, bcs_v = load_2d_muscle_bc(V_u, V_pv.sub(0), V_pv.sub(1), boundaries)
+
+    F = deformation_grad(u0)
+    I_1, I_2, J = invariants(F)
+    F_iso = isochronic_deformation_grad(F, J)
+    #I_1_iso, I_2_iso  = invariants(F_iso)[0:2]
+    W = material_mooney_rivlin(I_1, I_2, c_10, c_01)
+    g = incompr_constr(J)
+    # Lagrange function (without constraint)
+    L = -W
+    P = first_piola_stress(L, F)
+    G = incompr_stress(g, F)
+
+    # a_dyn_u = inner(u1 - u0, eta) * dx - dt * inner(v1, eta) * dx
+
+
+    u1 = fe.TrialFunction(V_u)
+    eta = fe.TestFunction(V_u)
+
+    #u11 = fe.Function(V_u)
+    #F1 = deformation_grad(u11)
+    #g1 = incompr_constr(fe.det(F1))
+    #G1 = incompr_stress(g1, F1)
+
+
+    (p1, v1) = fe.TrialFunctions(V_pv)
+    (q, xi) = fe.TestFunctions(V_pv)
+
+    a_dyn_u = inner(u1-u0,eta)*dx - dt*inner(v0,eta)*dx
+
+    a_dyn_p = fe.tr(G*grad(v1))*q*dx
+    #a_dyn_v = rho*inner(v1-v0, xi)*dx + dt*(inner(P + p0*G, grad(xi))*dx - inner(B, xi)*dx)
+    a_dyn_v = rho*inner(v1-v0, xi)*dx + dt*(inner(P, grad(xi))*dx + inner(p1*G,grad(xi))*dx - inner(B, xi)*dx)
+
+
+    a_u = fe.lhs(a_dyn_u)
+    l_u = fe.rhs(a_dyn_u)
+
+    a_pv = fe.lhs(a_dyn_p + a_dyn_v)
+    l_pv = fe.rhs(a_dyn_p + a_dyn_v)
+
+
+    u1 = fe.Function(V_u)
+    pv1 = fe.Function(V_pv)
+
+    sol = []
+
+    vol = fe.assemble(1.*dx)
+
+    A_u = fe.assemble(a_u)
+    A_pv = fe.assemble(a_pv)
+
+    for bc in bcs_u:
+        bc.apply(A_u)
+
+    t = 0
+    while t < t_end:
+        print("progress: %f" % (100.*t/t_end))
+
+        # update displacement u
+        L_u = fe.assemble(l_u)
+        fe.solve(A_u, u1.vector(), L_u)
+        u0.assign(u1)
+
+
+        L_pv = fe.assemble(l_pv)
+        for bc in bcs_p + bcs_v:
+            bc.apply(A_pv, L_pv)
+
+        fe.solve(A_pv, pv1.vector(), L_pv)
+
+        if fe.norm(pv1.vector()) > 1e8:
+            print('ERROR: norm explosion')
+            break
+
+        # update initial values for next step
+        w0.u = u1
+        w0.pv = pv1
+        p0.assign(w0.p)
+        v0.assign(w0.v)
+
+
+        t += dt
+
+        if show_plots:
+            # plot result
+            fe.plot(w0.sub(0), mode='displacement')
+            plt.show()
+
+        # save solutions
+        sol.append(Solution(t=t))
+        sol[-1].upv.assign(w0)
+
+    return sol, W
+
+
 
 B.assign(fe.Constant((10000, 0)))
 
@@ -373,8 +537,8 @@ w0 = Solution()
 w0.up = w
 w0.t = 0
 
-dt = 1.e-5
-sol, W, kappa = explicit_relax_dyn(w0, kappa=1e4, dt=dt, t_end=1000*dt, show_plots=False)
+dt = 2.e-5
+sol, W = half_exp_dyn(w0, dt=dt, t_end=500*dt, show_plots=False)
 # dif = explicit_relax_dyn(w0, kappa=1e4, dt=dt, t_end=1000*dt, show_plots=False)
 
 (u0, p0, v0) = fe.split(w0)
